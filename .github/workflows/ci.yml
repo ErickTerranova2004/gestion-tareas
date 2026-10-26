@@ -1,0 +1,172 @@
+name: CI/CD - Django
+
+on:
+  push:
+    branches: [main, ci-setup]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: gestion-tareas
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1) INTEGRACIÓN CONTINUA: inspección de código + pruebas
+  # ---------------------------------------------------------------
+  test:
+    name: Lint y pruebas
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: gestion_tareas
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_DB: gestion_tareas
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Análisis estático (flake8)
+        run: flake8 .
+
+      - name: Verificar migraciones pendientes
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Ejecutar pruebas
+        run: python manage.py test -v 2
+
+  # ---------------------------------------------------------------
+  # 2) BUILD: imagen Docker versionada y guardada como artefacto
+  # ---------------------------------------------------------------
+  build:
+    name: Build de imagen Docker
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Calcular versión de la release
+        id: version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.1.${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Versión calculada: $VERSION"
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Construir imagen
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          build-args: APP_VERSION=${{ steps.version.outputs.version }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Probar la imagen (smoke test)
+        run: |
+          docker run --rm --entrypoint python \
+            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }} \
+            -c "import django; print('Django', django.get_version())"
+
+      - name: Exportar imagen como artefacto
+        run: |
+          mkdir -p dist
+          docker save ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }} \
+            ${{ env.IMAGE_NAME }}:latest | gzip > dist/${{ env.IMAGE_NAME }}-${{ steps.version.outputs.version }}.tar.gz
+          ls -lh dist
+
+      - name: Guardar artefacto en GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: imagen-docker
+          path: dist/*.tar.gz
+          retention-days: 7
+
+      - name: Preparar publicación en DockerHub (simulado)
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME || 'usuario-dockerhub' }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          docker tag "$IMAGE_NAME:$VERSION" "$DOCKERHUB_USER/$IMAGE_NAME:$VERSION"
+          echo "Imagen etiquetada para DockerHub: $DOCKERHUB_USER/$IMAGE_NAME:$VERSION"
+          echo "Comando de publicación (no se ejecuta en modo simulado):"
+          echo "  docker push $DOCKERHUB_USER/$IMAGE_NAME:$VERSION"
+
+  # ---------------------------------------------------------------
+  # 3) DESPLIEGUE CONTINUO (simulado en una carpeta externa)
+  # ---------------------------------------------------------------
+  deploy-simulado:
+    name: Despliegue simulado
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Descargar artefacto de la imagen
+        uses: actions/download-artifact@v4
+        with:
+          name: imagen-docker
+          path: dist
+
+      - name: Desplegar y validar
+        run: |
+          bash scripts/deploy_simulado.sh \
+            --origen "$GITHUB_WORKSPACE" \
+            --destino "$RUNNER_TEMP/despliegue" \
+            --imagen-tar dist/${{ env.IMAGE_NAME }}-${{ needs.build.outputs.version }}.tar.gz \
+            --version "${{ needs.build.outputs.version }}"
+
+      - name: Logs del despliegue
+        if: always()
+        working-directory: ${{ runner.temp }}/despliegue
+        run: docker compose logs --no-color | tail -50
+
+      - name: Detener entorno
+        if: always()
+        working-directory: ${{ runner.temp }}/despliegue
+        run: docker compose down -v
