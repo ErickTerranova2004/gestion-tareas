@@ -1,0 +1,12 @@
+.git
+.github
+__pycache__/
+*.pyc
+venv/
+.venv/
+.env
+staticfiles/
+dist/
+*.tar
+*.tar.gz
+deploy-notes.md
